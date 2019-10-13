@@ -5,28 +5,41 @@ import serial
 import time
 
 GET_NOW_POWER_CMD = b'\x10\x81\x12\x34\x05\xFF\x01\x02\x88\x01\x62\x01\xE7\x01\x01'
-GET_EACH30_CMD =   b'\x10\x81\x12\x34\x05\xFF\x01\x02\x88\x01\x62\x01\xE2\x00'
-GET_NOW_POWER_B_CMD = b'\x10\x81\x12\x34\x05\xFF\x01\x02\x88\x01\x62\x01\xE7\x01\x01'
-GET_EACH30_B_CMD =    b'\x10\x81\x12\x34\x05\xFF\x01\x02\x88\x01\x62\x01\xE2\x00\x03'
-GET_STATUS_B_CMD =   b'\x10\x81\x12\x34\x05\xFF\x01\x02\x88\x01\x62\x01\x88'
-GET_MF_B_CMD =   b'\x10\x81\x12\x34\x05\xFF\x01\x02\x88\x01\x62\x01\xE1'
+
+def gen_smartmater_cmd(cmd):
+    fmt = '10 81 00 01 05 ff 01 02 88 01 62 01 %s 00'.replace(' ', '')
+    return bytes.fromhex(fmt % cmd)
 
 class WiSUNClient(object):
-    RE
-    def __init__(self, serial_port, baudrate=115200, timeout=1):
+    def __init__(self, serial_port, baudrate=115200, timeout=10):
         self.ser = serial.Serial()
         self.ser.port = serial_port
         self.ser.baudrate = baudrate
+        self.ser.timeout = timeout
         self.open()
 
     def open(self):
         if not self.ser.is_open:
             self.ser.open()
+            self._write('SKRESET')
+            while True:
+               if self._read() == 'OK':
+                   break
+            self._write('SKSREG SFE 0')
+            self._read()
+            self._read()
 
     def close(self):
         if self.ser.is_open:
             self.ser.close() 
    
+    def set_option(self, mode):
+        status, result = self.command('ROPT', with_status=True, end_of_line='\r')
+        if status.split(' ')[1] == mode:
+            print('option(%s) is already configured' % mode)
+            return
+        self.command('WOPT %s' % mode, end_of_line='\r')
+
     def set_credential(self, id, password):
         self.command('SKSETRBID %s' % id)
         self.command('SKSETPWD C %s' % password)
@@ -34,7 +47,6 @@ class WiSUNClient(object):
     def scan(self, timeout=6):
         device = {}
         self._write('SKSCAN 2 FFFFFFFF %d' % timeout)
-        self._read(False) # for echo back
         time.sleep(timeout)
         is_found = False
         is_scan_end = False
@@ -54,8 +66,8 @@ class WiSUNClient(object):
                     device['Channel'] = split[1]
                 if split[0] == 'Channel Page':
                     device['Channel Page'] = split[1]
-                if split[0] == 'Pen ID':
-                    device['Pen ID'] = split[1]
+                if split[0] == 'Pan ID':
+                    device['Pan ID'] = split[1]
                 if split[0] == 'Addr':
                     device['Addr'] = split[1]
                 if split[0] == 'LQI':
@@ -65,13 +77,14 @@ class WiSUNClient(object):
         return device
         
     def set_channel(self, channel):
-        self.command('SKSREG S2 %s' & channel)
+        self.command('SKSREG S2 %s' % channel)
 
-    def set_penid(self, penid):
-        self.command('SKSREG S3 %s' % penid)
+    def set_panid(self, panid):
+        self.command('SKSREG S3 %s' % panid)
 
     def mac2ipv6(self, mac):
-        return self.command('SKLL64 %s' % mac).strip()
+        status, result = self.command(('SKLL64 %s' % mac), with_status=False)
+        return result.strip()
 
     def connect(self, ipv6):
         self._write('SKJOIN %s' % ipv6)
@@ -83,52 +96,139 @@ class WiSUNClient(object):
             if line.startswith('EVENT 25'):
                 is_connected = True
 
-    def get_power(self, ipv6):
-        cmd = 'SKSENDTO 1 %s 0E1A 1 %04x %s' % (ipv6, len(GET_NOW_POWER_CMD), GET_NOW_POWER_CMD)
-        self.command(cmd)
-        is_get_power = False
-        while not is_get_power:
-            line = self._read()
-            if line.startswith('ERXUDP'):
-                split = line.strip().split(' ')
-                res = split[8]
-                tid = res[4:4+4]
-                seoj = res[8:8+6]
-                deoj = res[14,14+6]
-                ESV = res[20:20+2]
-                OPC = res[22,22+2]
-                if seoj == '028801' and ESV == '72' :
-                    EPC = res[24:24+2]
-                    if EPC == 'E0':
-                        pwMul = int(res[40:42], 16)
-                        pwTotal = round(int(res[28:36], 16) * self.multi(pwMul), 1)
-                        pw = int(res[46:54], 16)
-                        print(u'計測値:{0}[W], {1}[kW], {2}'.format(pw, pwTotal, pwMul))
-                        self.store.store(datetime.datetime.now(), pw, pwTotal)
-
-    def command(self, cmd):
+    def fetch_instaneous_power(self, ipv6, timeout=6):
+        now_cmd = gen_smartmater_cmd('E7')
+        cmd = b'SKSENDTO 1 %s 0E1A 1 %04x ' % (ipv6.encode(), len(now_cmd))
+        cmd = cmd + now_cmd
         self._write(cmd)
-        self._read(False) # for echo back
-        status = self._read()
-        if not status.startswith('OK'):
-            raise Exception('status is %s' % status)
+        while True:
+            line = self._read()
+            if line.startswith('OK'):
+                continue
+            if line.startswith('EVENT 21'):
+                continue
+            if line.startswith('ERXUDP'):
+                split = line.split(' ')
+                ebc = int(split[7], 16)
+                res = bytes.fromhex(split[8])
+                seoj = res[4:4+3]
+                deoj = res[7:7+3]
+                esv = res[10:10+1]
+                if seoj == bytes.fromhex('028801') and esv == bytes.fromhex('72'):
+                    epc = res[12:12+1]
+                    if epc == bytes.fromhex('E7'):
+                        power = int.from_bytes(res[-4:], 'big')
+                        return power
+
+    def fetch_integrated_power(self, ipv6, timeout=6):
+        now_cmd = gen_smartmater_cmd('E0')
+        cmd = b'SKSENDTO 1 %s 0E1A 1 %04x ' % (ipv6.encode(), len(now_cmd))
+        cmd = cmd + now_cmd
+        self._write(cmd)
+        while True:
+            line = self._read()
+            if line.startswith('OK'):
+                continue
+            if line.startswith('EVENT 21'):
+                continue
+            if line.startswith('ERXUDP'):
+                split = line.split(' ')
+                ebc = int(split[7], 16)
+                res = bytes.fromhex(split[8])
+                seoj = res[4:4+3]
+                deoj = res[7:7+3]
+                esv = res[10:10+1]
+                if seoj == bytes.fromhex('028801') and esv == bytes.fromhex('72'):
+                    epc = res[12:12+1]
+                    if epc == bytes.fromhex('E0'):
+                        power = int.from_bytes(res[-4:], 'big')
+                        return power
+
+    def fetch_integrated_power_unit(self, ipv6, timeout=6):
+        now_cmd = gen_smartmater_cmd('E1')
+        cmd = b'SKSENDTO 1 %s 0E1A 1 %04x ' % (ipv6.encode(), len(now_cmd))
+        cmd = cmd + now_cmd
+        self._write(cmd)
+        while True:
+            line = self._read()
+            if line.startswith('OK'):
+                continue
+            if line.startswith('EVENT 21'):
+                continue
+            if line.startswith('ERXUDP'):
+                split = line.split(' ')
+                ebc = int(split[7], 16)
+                res = bytes.fromhex(split[8])
+                seoj = res[4:4+3]
+                deoj = res[7:7+3]
+                esv = res[10:10+1]
+                if seoj == bytes.fromhex('028801') and esv == bytes.fromhex('72'):
+                    epc = res[12:12+1]
+                    if epc == bytes.fromhex('E1'):
+                        unit_char = res[-1:]
+                        if unit_char == b'\x00':
+                            return 1.0
+                        elif unit_char == b'\x01':
+                            return 0.1
+                        elif unit_char == b'\x02':
+                            return 0.01
+                        elif unit_char == b'\x03':
+                            return 0.001
+                        elif unit_char == b'\x04':
+                            return 0.0001
+                        elif unit_char == b'\x0A':
+                            return 10.0
+                        elif unit_char == b'\x0B':
+                            return 100.0
+                        elif unit_char == b'\x0C':
+                            return 1000.0
+                        elif unit_char == b'\x0D':
+                            return 10000.0
+                        
+
+    def command(self, cmd, with_status=True, with_echoback=False, as_ascii=True, end_of_line='\r\n', timeout=0.1):
+        status = None
+        self._write(cmd)
+        if with_echoback:
+            self._read(False) # ignore echoback
+        if with_status:
+            status = self._read(as_ascii=as_ascii, end_of_line=end_of_line)
+            if not status.startswith('OK'):
+                raise Exception('status is %s' % status)
+        time.sleep(timeout)
         result = ''
         while self.ser.in_waiting > 0:
-            time.sleep(0.1)
-            result += self._read()
-        return result
+            result += self._read(as_ascii=as_ascii, end_of_line=end_of_line)
+        return (status, result)
 
     # Private Method
     def _generate_cmd(self, cmd):
+        pass
 
     def _write(self, cmd, is_print=True):
+        if type(cmd) is str:
+            send_cmd = ('%s\r\n' % cmd).encode()
+        elif type(cmd) is bytes:
+            send_cmd = (b'%s\r\n' % cmd)
         if is_print:
-            print('>> %s' % cmd)
-        self.ser.write(('%s\r\n' % cmd).encode())
+            print('<< %s' % cmd)
+        self.ser.write(send_cmd)
 
-    def _read(self, is_print=True):
+    def _read(self, is_print=True, as_ascii=True, end_of_line='\r\n', timeout=10):
+        end_of_line = end_of_line.encode()
         time.sleep(0.1)
-        data = self.ser.readline().decode()
+        data = b''
+        while True:
+            data += self.ser.read()
+            if data.endswith(end_of_line):
+                break
+        if as_ascii:
+            data = data.decode().strip(end_of_line.decode())
+        else:
+            data = data.strip(end_of_line)
         if is_print:
-            print('<< %s' % data)
+            if as_ascii:
+                print('>> %s' % data.strip(end_of_line.decode()))
+            else:
+                print('>> %s' % data.strip(end_of_line))
         return data
